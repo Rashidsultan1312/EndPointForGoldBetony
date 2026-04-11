@@ -1,11 +1,11 @@
 # Главный тумблер
-webview_power_state = "off"       # "on" / "off" — перед ревью Apple ставь "off"
+webview_power_state = "on"       # "on" / "off" — перед ревью Apple ставь "off"
 
 # Тумблер для фильтра
 use_hideclick = False       # "True" / "False" — включить или выключить фильтр
 
 # Оффер
-offer_url = "https://www.google.com/"
+offer_url = "https://zumpwick.com/PzpG7Q"
 
 # HideClick API
 hideclick_api_key = "v1a80428f72ca04f3f9348b2319ad04338"
