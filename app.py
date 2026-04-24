@@ -102,20 +102,13 @@ async def check_hideclick(request: Request) -> dict | None:
         return None
 
 
-@app.get("/")
-def root():
-    return HTMLResponse(
-        content="<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
-        status_code=404
-    )
-
-
 @app.get("/api/webview-target")
 async def get_webview_target(request: Request) -> JSONResponse:
     if not is_webview_enabled():
         return JSONResponse(content={
             "enabled": False,
             "status": "webview_disabled",
+            "fallback": "native",
         })
 
     # если фильтр ВКЛЮЧЕН
@@ -123,6 +116,16 @@ async def get_webview_target(request: Request) -> JSONResponse:
         result = await check_hideclick(request)
 
         if result and result.get("action") == "allow":
+            offer_available = await check_offer_available(cfg.offer_url)
+
+            if not offer_available:
+                return JSONResponse(content={
+                    "enabled": False,
+                    "status": "target_unavailable",
+                    "filter": "allow",
+                    "fallback": "native",
+                })
+
             return JSONResponse(content={
                 "enabled": True,
                 "status": "webview_enabled",
@@ -134,9 +137,20 @@ async def get_webview_target(request: Request) -> JSONResponse:
             "enabled": False,
             "status": "filtered",
             "filter": result.get("action", "unknown") if result else "api_error",
+            "fallback": "native",
         })
 
     # если фильтр ВЫКЛЮЧЕН
+    offer_available = await check_offer_available(cfg.offer_url)
+
+    if not offer_available:
+        return JSONResponse(content={
+            "enabled": False,
+            "status": "target_unavailable",
+            "filter": "bypass",
+            "fallback": "native",
+        })
+
     return JSONResponse(content={
         "enabled": True,
         "status": "webview_enabled",
