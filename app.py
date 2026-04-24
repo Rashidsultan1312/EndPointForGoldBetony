@@ -1,24 +1,62 @@
 import socket
 import json
+import time
 from pathlib import Path
+import httpx
 from urllib.parse import urlencode
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import config as cfg
-
 
 app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
 POLICY_DIR = BASE_DIR / "PrivacyPolicy"
 
+_IOS_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+_OFFER_CACHE_TTL = 60
+_offer_cache: dict[str, tuple[float, bool, int]] = {}
+
 
 def is_webview_enabled() -> bool:
     return cfg.webview_power_state.strip().lower() == "on"
+
+
+async def is_offer_alive(url: str) -> bool:
+    if not url:
+        return False
+
+    now = time.time()
+    cached = _offer_cache.get(url)
+    if cached and now - cached[0] < _OFFER_CACHE_TTL:
+        print(f"[offer-check] cache hit: {url} alive={cached[1]} status={cached[2]}")
+        return cached[1]
+
+    status = 0
+    alive = False
+    try:
+        async with httpx.AsyncClient(
+            timeout=5,
+            follow_redirects=True,
+            headers={"User-Agent": _IOS_UA, "Accept": "*/*"},
+        ) as client:
+            resp = await client.get(url)
+            status = resp.status_code
+            alive = status < 400
+    except Exception as e:
+        print(f"[offer-check] error for {url}: {e!r}")
+        alive = False
+
+    _offer_cache[url] = (now, alive, status)
+    print(f"[offer-check] fresh: {url} alive={alive} status={status}")
+    return alive
 
 
 def resolve_hideclick_host() -> str:
@@ -29,18 +67,13 @@ def resolve_hideclick_host() -> str:
                 return ip
         except Exception:
             continue
-
     return "api.hideapi.xyz"
 
 
 async def check_hideclick(request: Request) -> dict | None:
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-
     if not ip:
-        ip = request.headers.get(
-            "x-real-ip",
-            request.client.host if request.client else "127.0.0.1"
-        )
+        ip = request.headers.get("x-real-ip", request.client.host if request.client else "127.0.0.1")
 
     headers_data = {
         "HTTP_USER_AGENT": request.headers.get("user-agent", ""),
@@ -93,71 +126,26 @@ async def check_hideclick(request: Request) -> dict | None:
         "mlSet": cfg.ml_set,
     }
 
-    for key, value in optional.items():
-        if value and value != "false":
-            params[key] = value
+    for k, v in optional.items():
+        if v and v != "false":
+            params[k] = v
 
     host = resolve_hideclick_host()
     url = f"http://{host}/basic?{urlencode(params)}"
 
     try:
         body = json.dumps(headers_data)
-
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, content=body)
-
-            if not resp.content or not resp.content.strip():
-                return None
-
             return resp.json()
-
     except Exception:
         return None
-
-
-async def check_offer_available(url: str) -> bool:
-    """
-    Проверяем, доступен ли offer_url перед тем,
-    как отдавать его приложению для открытия в WebView.
-
-    Если offer возвращает 404 / 410 / пустоту / ошибку —
-    считаем его недоступным и отправляем приложение в native fallback.
-    """
-
-    if not url:
-        return False
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=8,
-            follow_redirects=True
-        ) as client:
-            resp = await client.get(url)
-
-            if resp.status_code in (404, 410):
-                return False
-
-            if not resp.content or not resp.content.strip():
-                return False
-
-            if 200 <= resp.status_code < 400:
-                return True
-
-            return False
-
-    except Exception:
-        return False
 
 
 @app.get("/")
 def root():
     return HTMLResponse(
-        content=(
-            "<html>"
-            "<head><title>404 Not Found</title></head>"
-            "<body><h1>404 Not Found</h1></body>"
-            "</html>"
-        ),
+        content="<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
         status_code=404
     )
 
@@ -168,26 +156,18 @@ async def get_webview_target(request: Request) -> JSONResponse:
         return JSONResponse(content={
             "enabled": False,
             "status": "webview_disabled",
-            "fallback": "native",
         })
 
-    # Сценарий 1:
-    # Главный WebView-тумблер включён.
-    # HideClick-фильтр включён.
+    # если фильтр ВКЛЮЧЕН
     if cfg.use_hideclick:
         result = await check_hideclick(request)
 
         if result and result.get("action") == "allow":
-            offer_available = await check_offer_available(cfg.offer_url)
-
-            if not offer_available:
+            if not await is_offer_alive(cfg.offer_url):
                 return JSONResponse(content={
                     "enabled": False,
-                    "status": "target_unavailable",
-                    "filter": "allow",
-                    "fallback": "native",
+                    "status": "offer_dead",
                 })
-
             return JSONResponse(content={
                 "enabled": True,
                 "status": "webview_enabled",
@@ -199,23 +179,13 @@ async def get_webview_target(request: Request) -> JSONResponse:
             "enabled": False,
             "status": "filtered",
             "filter": result.get("action", "unknown") if result else "api_error",
-            "fallback": "native",
         })
 
-    # Сценарий 2:
-    # Главный WebView-тумблер включён.
-    # HideClick-фильтр выключен.
-    # Проверяем offer напрямую.
-    offer_available = await check_offer_available(cfg.offer_url)
-
-    if not offer_available:
+    if not await is_offer_alive(cfg.offer_url):
         return JSONResponse(content={
             "enabled": False,
-            "status": "target_unavailable",
-            "filter": "bypass",
-            "fallback": "native",
+            "status": "offer_dead",
         })
-
     return JSONResponse(content={
         "enabled": True,
         "status": "webview_enabled",
@@ -223,13 +193,7 @@ async def get_webview_target(request: Request) -> JSONResponse:
         "filter": "bypass",
     })
 
-
-# Статика для css/js/images из папки PrivacyPolicy
-app.mount(
-    "/policy-static",
-    StaticFiles(directory=POLICY_DIR),
-    name="policy-static"
-)
+app.mount("/policy-static", StaticFiles(directory=POLICY_DIR), name="policy-static")
 
 
 @app.get("/policy")
