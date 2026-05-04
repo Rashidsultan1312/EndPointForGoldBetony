@@ -1,11 +1,7 @@
-import socket
-import json
 from pathlib import Path
-import httpx
-from urllib.parse import urlencode
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, HTMLResponse
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import config as cfg
@@ -15,9 +11,9 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 POLICY_DIR = BASE_DIR / "PrivacyPolicy"
 
+
 def is_webview_enabled() -> bool:
     return cfg.webview_power_state.strip().lower() == "on"
-
 
 
 @app.get("/")
@@ -29,7 +25,7 @@ def root():
 
 
 @app.get("/api/webview-target")
-async def get_webview_target(request: Request) -> JSONResponse:
+async def get_webview_target() -> JSONResponse:
     if not is_webview_enabled():
         return JSONResponse(content={
             "enabled": False,
